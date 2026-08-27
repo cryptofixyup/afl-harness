@@ -1,0 +1,1 @@
+CI trigger marker. This file exists solely to create a genuine push event for the configured GitHub Actions workflow. It contains no runtime code.
