@@ -78,3 +78,112 @@ jobs:
         run: |
           mkdir -p findings
           AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -V 10 -i corpus -o findings -- build/afl_harness
+
+  fuzz-extended:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    needs: fuzz-smoke
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install AFL++ and LLVM tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends afl++ clang llvm
+
+      - name: Prepare corpus
+        run: |
+          mkdir -p build corpus findings
+          printf 'seed' > corpus/seed
+          printf 'AFL!v1' > corpus/magic
+          printf '\x00\x01\x02\x03\x04\x05' > corpus/binary
+
+      - name: Build AFL++ target
+        run: |
+          afl-clang-fast -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc \
+            src/afl_harness.c -o build/afl_harness
+
+      - name: Extended AFL++ campaign
+        env:
+          AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: '1'
+        run: |
+          set -euo pipefail
+          rm -rf findings
+          mkdir -p findings
+          timeout --signal=TERM --kill-after=15s 7m \
+            env AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 \
+            afl-fuzz -V 360 -i corpus -o findings -- build/afl_harness
+
+      - name: Record AFL++ statistics
+        if: always()
+        run: |
+          set -euo pipefail
+          stats="findings/default/fuzzer_stats"
+          test -f "$stats"
+          cp "$stats" findings/fuzzer_stats.txt
+          grep -E '^(start_time|run_time|last_update|cycles_done|cycles_wo_finds|execs_done|execs_per_sec|paths_total|paths_found|paths_favored|unique_crashes|unique_hangs|execs_since_crash) :' "$stats" || true
+
+      - name: Triage crashes and hangs
+        run: |
+          set -euo pipefail
+          crashes=0
+          hangs=0
+          if [ -d findings/default/crashes ]; then
+            crashes=$(find findings/default/crashes -type f -not -name README.txt | wc -l)
+          fi
+          if [ -d findings/default/hangs ]; then
+            hangs=$(find findings/default/hangs -type f -not -name README.txt | wc -l)
+          fi
+          printf 'crashes=%s\nhangs=%s\n' "$crashes" "$hangs" | tee findings/triage.txt
+          test "$crashes" -eq 0
+          test "$hangs" -eq 0
+
+      - name: Build ASan/UBSan replay target
+        run: |
+          clang -std=c11 -Wall -Wextra -Wpedantic -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Isrc src/afl_harness.c -o build/afl_harness_san
+
+      - name: Replay discovered crashes under ASan/UBSan
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d findings/default/crashes ]; then
+            while IFS= read -r -d '' input; do
+              ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+                UBSAN_OPTIONS=halt_on_error=1 \
+                timeout 10s ./build/afl_harness_san < "$input"
+            done < <(find findings/default/crashes -type f -not -name README.txt -print0)
+          fi
+
+      - name: Generate LLVM coverage
+        run: |
+          set -euo pipefail
+          rm -rf coverage
+          mkdir -p coverage
+          clang -std=c11 -g -O0 -fprofile-instr-generate -fcoverage-mapping \
+            -Isrc src/afl_harness.c -o build/afl_harness_cov
+          while IFS= read -r -d '' input; do
+            LLVM_PROFILE_FILE="coverage/%m-%p.profraw" \
+              timeout 5s ./build/afl_harness_cov < "$input" || true
+          done < <(find findings/default/queue -type f -not -name README.txt -print0 2>/dev/null || true)
+          if compgen -G 'coverage/*.profraw' > /dev/null; then
+            llvm-profdata merge -sparse coverage/*.profraw -o coverage/merged.profdata
+            llvm-cov report ./build/afl_harness_cov \
+              -instr-profile=coverage/merged.profdata | tee coverage/llvm-cov.txt
+          else
+            echo 'No LLVM profile data was produced.' | tee coverage/llvm-cov.txt
+            exit 1
+          fi
+
+      - name: Upload extended fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afl-extended-evidence
+          path: |
+            findings/
+            coverage/
+          if-no-files-found: error
+          retention-days: 14
