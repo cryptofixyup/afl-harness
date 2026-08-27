@@ -73,6 +73,8 @@ jobs:
             src/afl_harness.c -o build/afl_harness
 
       - name: AFL++ smoke run
+        env:
+          AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: '1'
         run: |
           mkdir -p findings
           AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -V 10 -i corpus -o findings -- build/afl_harness
