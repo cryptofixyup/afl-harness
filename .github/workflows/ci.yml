@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Python self-test
+        run: python3 src/validation_pipeline.py --self-test
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile native harness
+        run: |
+          mkdir -p build
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -Isrc \
+            src/afl_harness.c -o build/afl_harness
+
+      - name: Native unit tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
+            -DAFL_HARNESS_LIBRARY_ONLY -Isrc \
+            src/afl_harness.c tests/test_harness.c -o build/test_harness
+          ./build/test_harness
+
+      - name: Native smoke test
+        run: |
+          printf 'AFL!v1 smoke' | ./build/afl_harness
+
+      - name: Address/undefined sanitizer test
+        run: |
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -g -O1 \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -DAFL_HARNESS_LIBRARY_ONLY -Isrc \
+            src/afl_harness.c tests/test_harness.c -o build/test_harness_san
+          ASAN_OPTIONS=detect_leaks=1 ./build/test_harness_san
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install AFL++
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends afl++
+
+      - name: Build AFL++ target
+        run: |
+          mkdir -p build corpus
+          printf 'seed' > corpus/seed
+          afl-clang-fast -std=c11 -Wall -Wextra -Wpedantic -O2 -Isrc \
+            src/afl_harness.c -o build/afl_harness
+
+      - name: AFL++ smoke run
+        run: |
+          mkdir -p findings
+          AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 afl-fuzz -V 10 -i corpus -o findings -- build/afl_harness
